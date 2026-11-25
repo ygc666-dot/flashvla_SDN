@@ -13,6 +13,24 @@
 
 </div>
 
+> **Note: this is a modified fork, not the official release.**
+> This repository is `ygc666-dot`'s fork of
+> [ducido/SDN](https://github.com/ducido/SDN). The upstream code is unchanged
+> except for the additions below, made while studying SDN on top of FlashVLA:
+>
+> - `--method flashvla` in `policy/pizero/config.py`: a transport-only policy
+>   option; the checkpoint is served by a separate process, because SIMPLER's
+>   Python 3.10 env cannot import `lerobot`.
+> - `policy/pizero/flashvla_client.py`: dependency-free TCP client (numpy/pickle
+>   only) for `flashvla/scripts/p3/flashvla_server.py`.
+> - `policy/pizero/evaluate.py`: dispatch for the above, one server port per
+>   worker GPU.
+> - `policy/pizero/dump_utils.py` and
+>   `policy/pizero/scripts/run_episode_dump.sh`: per-episode tensor/observation
+>   dumps for debugging.
+>
+> These changes are exploratory and are **not** part of the published SDN
+> results. Use the upstream repository for the official code.
 
 Code and run scripts for **Selected Diffusion Noise (SDN)**, a training-free, test-time
 action-selection method for diffusion / flow-matching VLA policies. Each initial noise of

@@ -11,9 +11,14 @@ import copy
 #   sdn                : full SDN (grounding filter + smoothness refinement).
 #   sdn_grounding      : SDN stage 1 only.
 #   sdn_smooth         : SDN stage 2 only (no negative set needed).
-METHODS = ['vanilla', 'vanilla_perturbed', 'sdn', 'sdn_grounding', 'sdn_smooth']
+#   flashvla           : a `pi05-flashvla` checkpoint served by
+#                        scripts/p3/flashvla_server.py over TCP (G3). The model
+#                        cannot be loaded in-process here: SIMPLER's py3.10 env
+#                        has no lerobot and installing it would break sapien.
+METHODS = ['vanilla', 'vanilla_perturbed', 'sdn', 'sdn_grounding', 'sdn_smooth', 'flashvla']
 METHODS_WITH_NEGATIVE_IMAGE = ['vanilla_perturbed', 'sdn', 'sdn_grounding']
 SDN_METHODS = ['sdn', 'sdn_grounding', 'sdn_smooth']
+FLASHVLA_METHODS = ['flashvla']
 
 PIZERO_CONFIG = dict(
     cfg_dir='simpler_env/policies/pizero/open_pi_zero/config/eval',
@@ -41,6 +46,19 @@ NEGATIVE_IMAGE_CONFIG = dict(
     random_bbox_margin=10,
     version=2,
     get_all_parts=False,
+)
+
+# `--method flashvla`: the checkpoint is loaded by the remote policy server, so
+# only the transport is configurable here. `port` defaults to
+# `port_base + <worker GPU id>`, one server per GPU.
+FLASHVLA_CONFIG = dict(
+    port=None,
+    port_base=12400,
+    host='127.0.0.1',
+    exec_steps=4,
+    timeout=900.0,
+    connect_retries=20,
+    connect_wait_s=15.0,
 )
 
 
@@ -72,14 +90,26 @@ def get_negative_image_config(opts):
     return _override(copy.deepcopy(NEGATIVE_IMAGE_CONFIG), opts)
 
 
+def get_flashvla_config(checkpoint, task, opts):
+    """Transport-only config for `--method flashvla` (the server owns the model)."""
+    config = copy.deepcopy(FLASHVLA_CONFIG)
+    config['checkpoint_path'] = checkpoint
+    return _override(config, opts)
+
+
 def check_opts(opts):
-    known = set(PIZERO_CONFIG) | set(SDN_CONFIG) | set(NEGATIVE_IMAGE_CONFIG)
+    known = (set(PIZERO_CONFIG) | set(SDN_CONFIG) | set(NEGATIVE_IMAGE_CONFIG)
+             | set(FLASHVLA_CONFIG))
     unknown = sorted(set(opts) - known)
     if unknown:
         raise ValueError(f"Unknown options {unknown}; valid options are {sorted(known)}")
 
 
 def build_policy(checkpoint, task, opts, method):
+    if method in FLASHVLA_METHODS:
+        from policy.pizero.flashvla_client import FlashVLAInference
+        config = get_flashvla_config(checkpoint, task, opts)
+        return FlashVLAInference(**config), config
     config = get_policy_config(checkpoint, task, opts, method)
     if method in SDN_METHODS:
         from policy.pizero.sdn_policy import PiZeroSDNInference

@@ -7,7 +7,14 @@ Example (run from the repository root):
 Episodes are split across GPUs; each GPU process builds its own environment, policy and
 negative-image generator. Results (per-episode GIFs, the per-episode outcomes in 000_episodes.json
 and a summary log) are written to <result-root>/<method>/<opts>/<task>/. The episode seeds are
-0 .. n_trajs-1; runs with another number of episodes than 50 add `seeds=0-<n_trajs-1>` to <opts>.
+start_seed .. start_seed+n_trajs-1 (default start_seed=0); runs that do not use the default
+`seeds=0-49` add `seeds=<first>-<last>` to <opts>.
+
+Data collection (P1 of `docs/sdn_flashvla/flashvla_simpler/3.flashvla_simpler.md`):
+`--dump-episodes` additionally writes one <result-dir>/dump/episode_<seed>.npz + .mp4 per
+episode, holding the per-env-step (image, proprio, action, instruction, success) rows. Use
+`--method vanilla` for the teacher: dumping with SDN bakes the selection into the weights.
+See policy/pizero/dump_utils.py for the row convention.
 
 Reproducibility: episode e resets the environment and the pi0 noise with seed e, and the scene is
 rebuilt at every reset, so an episode does not depend on the
@@ -88,17 +95,22 @@ class ParallelRunner:
                  num_gpus=1,
                  result_root='./results',
                  n_trajs=50,
+                 start_seed=0,
                  reload_every=8,
                  save_video=True,
+                 dump_episodes=False,
+                 dump_images='mp4',
                  opts=None):
         self.method = method
         self.task = task
         self.checkpoint = checkpoint
         self.num_gpus = num_gpus
         self.result_root = result_root
-        self.seeds = list(range(n_trajs))
+        self.seeds = list(range(start_seed, start_seed + n_trajs))
         self.reload_every = reload_every
         self.save_video = save_video
+        self.dump_episodes = dump_episodes
+        self.dump_images = dump_images
         self.opts = dict(opts or {})
         self.use_negative_image = method in METHODS_WITH_NEGATIVE_IMAGE
 
@@ -202,6 +214,7 @@ class ParallelRunner:
         frames = []
         step_infos = []
         speeds = []
+        dumper = self._build_dumper(episode) if self.dump_episodes else None
 
         image = get_image_from_maniskill2_obs_dict(env, obs)
         neg_image = self._get_negative_image(obs, instruction)
@@ -210,21 +223,31 @@ class ParallelRunner:
         while not (predicted_terminated or truncated):
             proprio = obs['agent']['eef_pos']
             if self.method == 'vanilla':
-                _, actions = policy.step(image, instruction, proprio=proprio)
+                raw_chunk, actions = policy.step(image, instruction, proprio=proprio)
+            elif self.method == 'flashvla':
+                # Same chunk-of-n_action_steps execution pattern as pi0*'s
+                # act_steps=4; the FlashVLA server returns the hold pose during
+                # its cold-start queries, so `actions` is never empty.
+                raw_chunk, actions = policy.step(image, instruction, proprio=proprio)
             elif self.method == 'vanilla_perturbed':
-                _, actions = policy.step(neg_image, instruction, proprio=proprio)
+                raw_chunk, actions = policy.step(neg_image, instruction, proprio=proprio)
             elif self.method == 'sdn':
-                _, actions = policy.sdn_step(image, neg_image, instruction, proprio=proprio)
+                raw_chunk, actions = policy.sdn_step(image, neg_image, instruction, proprio=proprio)
             elif self.method == 'sdn_grounding':
-                _, actions = policy.grounding_step(image, neg_image, instruction, proprio=proprio)
+                raw_chunk, actions = policy.grounding_step(image, neg_image, instruction, proprio=proprio)
             elif self.method == 'sdn_smooth':
-                _, actions = policy.smooth_step(image, instruction, proprio=proprio)
+                raw_chunk, actions = policy.smooth_step(image, instruction, proprio=proprio)
             else:
                 raise ValueError(f"Unknown method {self.method}")
 
+            if dumper is not None:
+                dumper.begin_query(raw_chunk, instruction, timestep)
+
             for action in actions:
-                obs, reward, success, truncated, info = env.step(
-                    np.concatenate([action["world_vector"], action["rot_axangle"], action["gripper"]]))
+                # the observation this action is applied to (the dump pairs it with the action)
+                obs_image, obs_proprio = image, obs['agent']['eef_pos']
+                command = np.concatenate([action["world_vector"], action["rot_axangle"], action["gripper"]])
+                obs, reward, success, truncated, info = env.step(command)
                 speeds.append(float(np.linalg.norm(action["world_vector"])))
                 image = get_image_from_maniskill2_obs_dict(env, obs)
 
@@ -232,6 +255,13 @@ class ParallelRunner:
                 timestep += 1
                 step_infos.append(convert_numpy_or_torch_to_python(info))
                 predicted_terminated = bool(action["terminate_episode"][0] > 0)
+                if dumper is not None:
+                    dumper.add_step(image=obs_image, proprio=obs_proprio, command=command,
+                                    world_vector=action["world_vector"],
+                                    rot_axangle=action["rot_axangle"],
+                                    gripper=action["gripper"],
+                                    reward=reward, success=success, truncated=truncated,
+                                    instruction=instruction)
                 if show_detail:
                     self.logger.info(f"Step {timestep}: {step_infos[-1]}")
 
@@ -256,10 +286,23 @@ class ParallelRunner:
         info['speed'] = float(np.mean(speeds))  # mean translation command per env step
         success = info['success']
         self.logger.info(f"Episode {episode} finished with success {success}.")
+        if dumper is not None:
+            dumped = dumper.finalize(first_success=info.get('first_success', -1))
+            self.logger.info(f"Episode {episode} dumped {dumped['steps']} steps / "
+                             f"{dumped['n_queries']} queries to {osp.join(self.dump_dir, dumped['dump_npz'])}.")
         if self.save_video:
             write_video(frames, f"{self.result_dir}/episode_{episode}_success_{success}.gif")
         info['episode'] = episode
         return info
+
+    def _build_dumper(self, episode):
+        from policy.pizero.dump_utils import EpisodeDumper
+        return EpisodeDumper(out_dir=self.dump_dir,
+                             episode=episode,
+                             task=self.task,
+                             image_mode=self.dump_images,
+                             method=self.method,
+                             result_dir=self.result_dir)
 
     def _get_negative_image(self, obs, instruction):
         if not self.use_negative_image:
@@ -316,16 +359,25 @@ class ParallelRunner:
         if len(name) > 0:
             self.result_dir = osp.join(self.result_dir, '--'.join(name))
         self.result_dir = osp.join(self.result_dir, self.task)
+        self.dump_dir = osp.join(self.result_dir, 'dump')
 
         if osp.exists(self.result_dir):
             logs = [f for f in os.listdir(self.result_dir) if f.startswith('000') and f.endswith('.log')]
             if any(f.startswith('000_success_') for f in logs):
-                print(f"{self.result_dir} already finished, skipping.")
-                return False
-            print(f"{self.result_dir} exists but did not finish, starting over.")
+                if not self.dump_episodes or self._dump_complete():
+                    print(f"{self.result_dir} already finished, skipping.")
+                    return False
+                print(f"{self.result_dir} already finished but its dump is incomplete, starting over.")
+            else:
+                print(f"{self.result_dir} exists but did not finish, starting over.")
             shutil.rmtree(self.result_dir)
         os.makedirs(self.result_dir)
         return True
+
+    def _dump_complete(self):
+        if not osp.isdir(self.dump_dir):
+            return False
+        return len([f for f in os.listdir(self.dump_dir) if f.endswith('.npz')]) >= len(self.seeds)
 
     def _write_error(self, episode, error):
         with open(osp.join(self.result_dir, f"000_episode_{episode}_error.log"), 'w') as f:
@@ -357,8 +409,11 @@ def main(args):
                                 num_gpus=args.num_gpus,
                                 result_root=args.result_root,
                                 n_trajs=args.n_trajs,
+                                start_seed=args.start_seed,
                                 reload_every=args.reload_every,
                                 save_video=not args.no_video,
+                                dump_episodes=args.dump_episodes,
+                                dump_images=args.dump_images,
                                 opts={**opts, **search})
         runner.run()
 
@@ -371,10 +426,19 @@ if __name__ == '__main__':
                         help="directory with the open-pi-zero checkpoints")
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--result-root", default="./results")
-    parser.add_argument("--n-trajs", type=int, default=50, help="number of rollouts (episode seeds 0 .. n_trajs-1)")
+    parser.add_argument("--n-trajs", type=int, default=50,
+                        help="number of rollouts (episode seeds start_seed .. start_seed+n_trajs-1)")
+    parser.add_argument("--start-seed", type=int, default=0,
+                        help="first episode seed; keep the collection seeds disjoint from the eval seeds")
     parser.add_argument("--reload-every", type=int, default=8,
                         help="rebuild the policy every n episodes per GPU (0 disables)")
     parser.add_argument("--no-video", action="store_true", help="do not save per-episode GIFs")
+    parser.add_argument("--dump-episodes", action="store_true",
+                        help="write one <result-dir>/dump/episode_<seed>.npz (+.mp4) per episode; "
+                             "use --method vanilla for teacher data")
+    parser.add_argument("--dump-images", choices=["mp4", "npz", "none"], default="mp4",
+                        help="per-step RGB storage for --dump-episodes: mp4 (h264, default), "
+                             "npz (lossless, ~10x bigger) or none (numeric-only smoke run)")
     parser.add_argument("--opts", nargs="+", default=[],
                         help="config overrides as key value pairs, e.g. knn_k 6 top_m 3 negative_mode inpaint")
     parser.add_argument("--search-opts", nargs="+", default=[],
